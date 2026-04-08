@@ -52,8 +52,17 @@ const MODEL_NAME_MAP: Record<string, string> = {
   sonnet: "claude-sonnet-4",
   opus: "claude-opus-4.6-1m",
   "claude-opus-4": "claude-opus-4.6-1m",
-  "claude-haiku-4": "claude-haiku-4.5",
+  "claude-opus-4-0": "claude-opus-4.6-1m",
+  "claude-opus-4-1": "claude-opus-4.6-1m",
+  "claude-opus-4-5": "claude-opus-4.6-1m",
+  "claude-opus-4.5": "claude-opus-4.6-1m",
   "claude-opus-4.6-1m": "claude-opus-4.6-1m",
+  "claude-sonnet-4-0": "claude-sonnet-4",
+  "claude-sonnet-4-5": "claude-sonnet-4",
+  "claude-sonnet-4.5": "claude-sonnet-4",
+  "claude-sonnet-4-6": "claude-sonnet-4",
+  "claude-haiku-4": "claude-haiku-4.5",
+  "claude-haiku-4-5": "claude-haiku-4.5",
 }
 
 // Pattern-based model mappings: [pattern, target]
@@ -112,17 +121,17 @@ function translateAnthropicMessagesToOpenAI(
 }
 
 // Reserved keywords that GitHub Copilot API blocks in system prompts
-// These will be completely removed from system prompts
-const RESERVED_KEYWORDS = [
-  "x-anthropic-billing-header",
-  "anthropic-billing-header",
-  "x-anthropic-",
+// These will be completely removed from system prompts (case-insensitive)
+const RESERVED_KEYWORD_PATTERNS = [
+  /x-anthropic-billing-header/gi,
+  /anthropic-billing-header/gi,
+  /x-anthropic-/gi,
 ]
 
 function sanitizeSystemPrompt(text: string): string {
   let sanitized = text
-  for (const keyword of RESERVED_KEYWORDS) {
-    sanitized = sanitized.replaceAll(keyword, "")
+  for (const pattern of RESERVED_KEYWORD_PATTERNS) {
+    sanitized = sanitized.replaceAll(pattern, "")
   }
   return sanitized
 }

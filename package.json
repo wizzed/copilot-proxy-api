@@ -1,6 +1,6 @@
 {
   "name": "copilot-proxy-api",
-  "version": "0.7.5",
+  "version": "0.8.0",
   "description": "Turn GitHub Copilot into OpenAI/Anthropic API compatible server. Usable with Claude Code and Codex CLI!",
   "keywords": [
     "proxy",
@@ -16,10 +16,10 @@
     "type": "git",
     "url": "git+https://github.com/voidsteed/copilot-proxy-api.git"
   },
-  "author": "Erick Christian <erickchristian48@gmail.com>",
+  "author": "Yujun Liu <dreamzack@gmail.com>",
   "type": "module",
   "bin": {
-    "copilot-proxy-api": "./dist/main.js"
+    "copilot-proxy-api": "./dist/main.mjs"
   },
   "files": [
     "dist"
@@ -43,29 +43,29 @@
     "*": "bun run lint --fix"
   },
   "dependencies": {
-    "citty": "^0.1.6",
-    "clipboardy": "^5.0.0",
+    "citty": "^0.2.2",
+    "clipboardy": "^5.3.1",
     "consola": "^3.4.2",
-    "fetch-event-stream": "^0.1.5",
-    "gpt-tokenizer": "^3.0.1",
-    "hono": "^4.9.9",
-    "proxy-from-env": "^1.1.0",
+    "fetch-event-stream": "^0.1.6",
+    "gpt-tokenizer": "^3.4.0",
+    "hono": "^4.12.12",
+    "proxy-from-env": "^2.1.0",
     "srvx": "^0.8.9",
     "tiny-invariant": "^1.3.3",
     "undici": "^7.16.0",
-    "zod": "^4.1.11"
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@echristian/eslint-config": "^0.0.54",
-    "@types/bun": "^1.2.23",
+    "@types/bun": "^1.3.11",
     "@types/proxy-from-env": "^1.0.4",
-    "bumpp": "^10.2.3",
-    "eslint": "^9.37.0",
-    "knip": "^5.64.1",
-    "lint-staged": "^16.2.3",
+    "bumpp": "^11.0.1",
+    "eslint": "9",
+    "knip": "^6.3.0",
+    "lint-staged": "^16.4.0",
     "prettier-plugin-packagejson": "^2.5.19",
     "simple-git-hooks": "^2.13.1",
-    "tsdown": "^0.15.6",
+    "tsdown": "^0.21.7",
     "typescript": "^5.9.3"
   }
 }

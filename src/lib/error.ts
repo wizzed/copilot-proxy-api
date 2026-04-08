@@ -38,7 +38,8 @@ export async function forwardError(c: Context, error: unknown) {
   return c.json(
     {
       error: {
-        message: (error as Error).message,
+        message:
+          error instanceof Error ? error.message : "An unknown error occurred",
         type: "error",
       },
     },

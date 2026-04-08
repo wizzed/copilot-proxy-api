@@ -1,3 +1,4 @@
+import consola from "consola"
 import { Hono } from "hono"
 
 import { state } from "~/lib/state"
@@ -10,7 +11,7 @@ tokenRoute.get("/", (c) => {
       token: state.copilotToken,
     })
   } catch (error) {
-    console.error("Error fetching token:", error)
+    consola.error("Error fetching token:", error)
     return c.json({ error: "Failed to fetch token", token: null }, 500)
   }
 })

@@ -53,8 +53,20 @@ export async function handleResponses(c: Context): Promise<Response> {
 
     await sendCreatedEvent(stream, streamState)
 
-    for await (const rawEvent of response) {
-      await processStreamChunk(rawEvent, stream, streamState)
+    try {
+      for await (const rawEvent of response) {
+        await processStreamChunk(rawEvent, stream, streamState)
+      }
+    } catch (error) {
+      consola.error("Streaming error:", error)
+      await stream.writeSSE({
+        event: "error",
+        data: JSON.stringify({
+          type: "error",
+          message:
+            error instanceof Error ? error.message : "Stream interrupted",
+        }),
+      })
     }
 
     await sendDoneEvent(stream, streamState)

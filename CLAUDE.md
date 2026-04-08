@@ -304,8 +304,8 @@ Tests use `bun:test` and focus on translation logic validation:
 │  content-type:         application/json                          │
 │  copilot-integration-id: vscode-chat                             │
 │  editor-version:       vscode/${vsCodeVersion}                   │
-│  editor-plugin-version: copilot-chat/0.42.0                      │
-│  user-agent:           GitHubCopilotChat/0.42.0                  │
+│  editor-plugin-version: copilot-chat/0.43.0                      │
+│  user-agent:           GitHubCopilotChat/0.43.0                  │
 │  openai-intent:        conversation-panel                        │
 │  x-github-api-version: 2025-04-01                                │
 │  x-request-id:         ${randomUUID()}                           │

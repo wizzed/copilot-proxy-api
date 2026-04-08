@@ -9,6 +9,7 @@ export default defineConfig({
 
   sourcemap: true,
   clean: true,
+  minify: true,
   removeNodeProtocol: false,
 
   env: {

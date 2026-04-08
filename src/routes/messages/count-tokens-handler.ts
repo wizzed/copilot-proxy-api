@@ -25,9 +25,16 @@ export async function handleCountTokens(c: Context) {
 
     if (!selectedModel) {
       consola.warn("Model not found, returning default token count")
-      return c.json({
-        input_tokens: 1,
-      })
+      return c.json(
+        {
+          type: "error",
+          error: {
+            type: "not_found_error",
+            message: `Model '${openAIPayload.model}' not found`,
+          },
+        },
+        404,
+      )
     }
 
     const tokenCount = await getTokenCount(openAIPayload, selectedModel)
@@ -63,8 +70,15 @@ export async function handleCountTokens(c: Context) {
     })
   } catch (error) {
     consola.error("Error counting tokens:", error)
-    return c.json({
-      input_tokens: 1,
-    })
+    return c.json(
+      {
+        type: "error",
+        error: {
+          type: "api_error",
+          message: "Failed to count tokens",
+        },
+      },
+      500,
+    )
   }
 }
