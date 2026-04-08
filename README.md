@@ -311,8 +311,8 @@ Here is an example `.claude/settings.json` file:
   "env": {
     "ANTHROPIC_BASE_URL": "http://localhost:4141/",
     "ANTHROPIC_AUTH_TOKEN": "dummy",
-    "ANTHROPIC_MODEL": "claude-opus-4.5",
-    "ANTHROPIC_SMALL_FAST_MODEL": "claude-sonnet-4.5",
+    "ANTHROPIC_MODEL": "claude-opus-4.6-1m",
+    "ANTHROPIC_SMALL_FAST_MODEL": "claude-sonnet-4",
     "DISABLE_NON_ESSENTIAL_MODEL_CALLS": "1",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
   },
@@ -322,6 +322,9 @@ Here is an example `.claude/settings.json` file:
     ]
   }
 }
+```
+
+> **Note:** The recommended model is `claude-opus-4.6-1m` which supports 1M context window. If your tool doesn't support specifying `claude-opus-4.6-1m`, you can use `claude-opus-4.6` instead - the proxy will automatically map it to the correct model.
 ```
 
 You can find more options here: [Claude Code settings](https://docs.anthropic.com/en/docs/claude-code/settings#environment-variables)

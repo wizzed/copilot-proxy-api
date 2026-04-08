@@ -50,9 +50,10 @@ export function translateToOpenAI(
 const MODEL_NAME_MAP: Record<string, string> = {
   haiku: "claude-haiku-4.5",
   sonnet: "claude-sonnet-4",
-  opus: "claude-opus-4.5",
-  "claude-opus-4": "claude-opus-4.5",
+  opus: "claude-opus-4.6-1m",
+  "claude-opus-4": "claude-opus-4.6-1m",
   "claude-haiku-4": "claude-haiku-4.5",
+  "claude-opus-4.6-1m": "claude-opus-4.6-1m",
 }
 
 // Pattern-based model mappings: [pattern, target]
@@ -62,15 +63,18 @@ const MODEL_PATTERN_MAP: Array<[string, string]> = [
   ["claude-3.5-sonnet", "claude-sonnet-4"],
   ["claude-3-5-haiku", "claude-haiku-4.5"],
   ["claude-3.5-haiku", "claude-haiku-4.5"],
-  ["claude-3-opus", "claude-opus-4.5"],
-  ["claude-3.0-opus", "claude-opus-4.5"],
+  ["claude-3-opus", "claude-opus-4.6-1m"],
+  ["claude-3.0-opus", "claude-opus-4.6-1m"],
   // Claude 4.x models with version suffixes (e.g., claude-sonnet-4-20241022)
   ["claude-sonnet-4-", "claude-sonnet-4"],
   ["claude-sonnet-4.", "claude-sonnet-4"],
-  ["claude-opus-4-", "claude-opus-4.5"],
-  ["claude-opus-4.", "claude-opus-4.5"],
+  ["claude-opus-4-", "claude-opus-4.6-1m"],
+  ["claude-opus-4.", "claude-opus-4.6-1m"],
   ["claude-haiku-4-", "claude-haiku-4.5"],
   ["claude-haiku-4.", "claude-haiku-4.5"],
+  // Claude 4.6 models (including 1M context variants)
+  ["claude-opus-4.6", "claude-opus-4.6-1m"],
+  ["claude-sonnet-4.6", "claude-sonnet-4"],
 ]
 
 function translateModelName(model: string): string {
