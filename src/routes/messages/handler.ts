@@ -4,6 +4,7 @@ import consola from "consola"
 import { streamSSE } from "hono/streaming"
 
 import { awaitApproval } from "~/lib/approval"
+import { fitContext } from "~/lib/context-manager"
 import { checkRateLimit } from "~/lib/rate-limit"
 import { state } from "~/lib/state"
 import {
@@ -34,11 +35,22 @@ export async function handleCompletion(c: Context) {
     JSON.stringify(openAIPayload),
   )
 
+  // Token-based context management (OpenCode-style)
+  const model = state.models?.data.find((m) => m.id === openAIPayload.model)
+  const fittedPayload =
+    model ? await fitContext(openAIPayload, model) : openAIPayload
+
+  if (fittedPayload.messages.length !== openAIPayload.messages.length) {
+    consola.info(
+      `Context management: ${openAIPayload.messages.length} → ${fittedPayload.messages.length} messages`,
+    )
+  }
+
   if (state.manualApprove) {
     await awaitApproval()
   }
 
-  const response = await createChatCompletions(openAIPayload)
+  const response = await createChatCompletions(fittedPayload)
 
   if (isNonStreaming(response)) {
     consola.debug(

@@ -17,26 +17,74 @@ export const createChatCompletions = async (
   )
 
   // Agent/user check for X-Initiator header
-  // Determine if any message is from an agent ("assistant" or "tool")
   const isAgentCall = payload.messages.some((msg) =>
     ["assistant", "tool"].includes(msg.role),
   )
 
-  // Build headers and add X-Initiator
   const headers: Record<string, string> = {
     ...copilotHeaders(state, enableVision),
     "X-Initiator": isAgentCall ? "agent" : "user",
   }
 
+  const body = JSON.stringify(payload)
+  consola.info(
+    `Sending payload: ${body.length} bytes, ${payload.messages.length} messages, model: ${payload.model}`,
+  )
+
   const response = await fetch(`${copilotBaseUrl(state)}/chat/completions`, {
     method: "POST",
     headers,
-    body: JSON.stringify(payload),
+    body,
   })
 
   if (!response.ok) {
-    consola.error("Failed to create chat completions", response)
-    throw new HTTPError("Failed to create chat completions", response)
+    const errorBody = await response.text()
+    consola.error(
+      `Failed to create chat completions - Status: ${response.status} ${response.statusText}`,
+    )
+    consola.error(`Response body: ${errorBody}`)
+    consola.error(`Request payload size: ${body.length} bytes`)
+
+    // Detect context overflow errors (413, "request entity too large", etc.)
+    const isContextOverflow =
+      response.status === 413
+      || /request entity too large/i.test(errorBody)
+      || /exceeds the limit of \d+/i.test(errorBody)
+      || /context_length_exceeded/i.test(errorBody)
+
+    if (isContextOverflow) {
+      consola.warn(
+        "Context overflow detected — signaling overloaded_error to client",
+      )
+      // Return an Anthropic-compatible overloaded_error so Claude Code
+      // knows to compact/retry rather than treating it as a fatal error
+      throw new HTTPError(
+        "Context overflow",
+        new Response(
+          JSON.stringify({
+            type: "error",
+            error: {
+              type: "overloaded_error",
+              message: `Request too large for Copilot API (${body.length} bytes). Context overflow detected.`,
+            },
+          }),
+          {
+            status: 529,
+            statusText: "Overloaded",
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      )
+    }
+
+    throw new HTTPError(
+      "Failed to create chat completions",
+      new Response(errorBody, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      }),
+    )
   }
 
   if (payload.stream) {
