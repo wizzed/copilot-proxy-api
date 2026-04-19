@@ -43,6 +43,33 @@ A reverse-engineered proxy for the GitHub Copilot API that exposes it as an Open
 - **Flexible Authentication**: Authenticate interactively or provide a GitHub token directly, suitable for CI/CD environments.
 - **Support for Different Account Types**: Works with individual, business, and enterprise GitHub Copilot plans.
 
+## Claude Code Compatibility & Known Gaps
+
+This proxy is tuned for [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview) interop. The Anthropic Messages API surface is implemented to the extent Claude Code actually exercises it; **server-side / billing-side Anthropic features that Copilot does not provide are deliberately not faked**.
+
+What works:
+
+- `/v1/messages` (streaming and non-streaming) with text, image, tool_use, tool_result, and `document` (PDF) blocks.
+- `/v1/messages/count_tokens` (input tokens only, per Anthropic spec).
+- Anthropic-shaped error envelopes with proper `error.type` mapping (`invalid_request_error`, `authentication_error`, `permission_error`, `not_found_error`, `request_too_large`, `rate_limit_error`, `overloaded_error`, `api_error`).
+- Streaming keepalive (`event: ping` every 15 s) so Claude Code's 90 s idle watchdog doesn't tear down slow streams.
+- Mid-stream error cleanup — open `content_block_stop` / `message_stop` events emitted before the error event so Claude Code's content-block index tracker doesn't throw `Content block not found`.
+- Reactive context compaction — upstream 413 / backend timeouts are mapped to HTTP 400 `prompt is too long` so Claude Code triggers its built-in compaction flow.
+- Client-requested model echoed back in `response.model` (Copilot's internal id is not leaked).
+- `request-id` / `x-request-id` response headers.
+- Stop-reason mapping including `content_filter` → `refusal` (Claude Code has dedicated UX for refusal blocks).
+- PDF text extraction for `document` blocks ≤ 3 MB. Password-protected PDFs are rejected with a Claude-Code-recognizable error message.
+
+Known gaps (these reflect Copilot's actual capabilities — they are not bugs to file):
+
+- **Hard 2.5 MiB payload ceiling.** The Copilot gateway/backend has an empirically determined hard cliff at exactly 2,621,440 bytes for `claude-opus-4.6-1m`, regardless of the model's claimed 1 M token window. The proxy applies an OpenCode-style context-management pass (prune old tool outputs → strip old base64 images → drop oldest messages) and a 2,500,000-byte backstop before sending. Effective ceiling is ~500 K tokens.
+- **No real prompt cache writes.** Copilot's API exposes a `prompt_tokens_details.cached_tokens` counter that the proxy maps to `cache_read_input_tokens`. There is no `cache_creation_input_tokens` because Copilot doesn't write caches on our behalf. The proxy strips client-supplied `cache_control` markers via translation.
+- **No `thinking` blocks in responses.** Copilot doesn't expose extended thinking. Inbound `thinking` blocks from the assistant turn history are dropped on the request side rather than promoted to text (which would corrupt turn semantics).
+- **No server tools.** `computer_use`, `web_search`, `code_execution`, `text_editor`, `bash`, and other Anthropic-hosted tools are not implemented — Copilot has no equivalents.
+- **No Files API, Batches API, `mcp_servers` field, organization headers.** Claude Code does not depend on these for the proxy use case.
+- **No image-only PDFs.** PDF support is text-only via `pdf-parse`. Visual-only PDFs (scans, image-only diagrams) lose their content. For larger / image-heavy PDFs, Claude Code already pre-extracts to images on its side before sending.
+- **No live `api.anthropic.com` tests in CI.** The verify harness (`bun run verify`) is fixture-based and runs offline.
+
 ## Demo
 
 https://github.com/user-attachments/assets/7654b383-669d-4eb9-b23c-06d7aefee8c5

@@ -5,6 +5,7 @@ import { copilotHeaders, copilotBaseUrl } from "~/lib/api-config"
 import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
 
+/* eslint-disable complexity */
 export const createChatCompletions = async (
   payload: ChatCompletionsPayload,
 ) => {
@@ -45,12 +46,23 @@ export const createChatCompletions = async (
     consola.error(`Response body: ${errorBody}`)
     consola.error(`Request payload size: ${body.length} bytes`)
 
-    // Detect context overflow errors (413, "request entity too large", etc.)
+    // Detect context overflow errors. Includes:
+    //  - HTTP 413 from Azure Front Door (>~5.4 MB)
+    //  - Backend "operation timed out" / 500 in the 2.5 MiB - 5.3 MB dead
+    //    zone (Copilot backend hangs >90s instead of cleanly rejecting;
+    //    Bun fetch eventually surfaces this as a 500 or upstream timeout)
+    //  - Various worded variants Copilot has emitted in the past
     const isContextOverflow =
       response.status === 413
       || /request entity too large/i.test(errorBody)
       || /exceeds the limit of \d+/i.test(errorBody)
       || /context_length_exceeded/i.test(errorBody)
+      || /operation timed out/i.test(errorBody)
+      || /payload too large/i.test(errorBody)
+      || /maximum context length/i.test(errorBody)
+      || (response.status >= 500
+        && response.status < 600
+        && body.length > 2_000_000)
 
     if (isContextOverflow) {
       // Return HTTP 400 with "prompt is too long" so Claude Code's reactive

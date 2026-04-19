@@ -46,6 +46,29 @@ export interface AnthropicToolResultBlock {
   is_error?: boolean
 }
 
+/**
+ * Anthropic `document` block. Claude Code emits these for PDF attachments
+ * <= 3 MB when the target model is in its `isPDFSupported` allow-list.
+ * Copilot has no native PDF understanding, so the proxy extracts text and
+ * injects it as a plain text block.
+ *
+ * Spec: https://docs.anthropic.com/en/docs/build-with-claude/pdf-support
+ */
+export interface AnthropicDocumentBlock {
+  type: "document"
+  source:
+    | {
+        type: "base64"
+        media_type: "application/pdf"
+        data: string
+      }
+    | { type: "url"; url: string }
+    | { type: "text"; media_type: "text/plain"; data: string }
+  title?: string
+  context?: string
+  citations?: { enabled?: boolean }
+}
+
 export interface AnthropicToolUseBlock {
   type: "tool_use"
   id: string
@@ -62,6 +85,7 @@ export type AnthropicUserContentBlock =
   | AnthropicTextBlock
   | AnthropicImageBlock
   | AnthropicToolResultBlock
+  | AnthropicDocumentBlock
 
 export type AnthropicAssistantContentBlock =
   | AnthropicTextBlock

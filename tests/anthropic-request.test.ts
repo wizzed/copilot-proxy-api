@@ -125,7 +125,11 @@ describe("Anthropic to OpenAI translation logic", () => {
     expect(isValidChatCompletionRequest(openAIPayload)).toBe(false)
   })
 
-  test("should handle thinking blocks in assistant messages", () => {
+  test("should drop thinking blocks from assistant messages (preserve text)", () => {
+    // Thinking blocks have signed-by-Anthropic semantics that Copilot can't
+    // verify. The proxy drops them on the request side rather than promoting
+    // their content to plain text (which would corrupt assistant turn
+    // semantics by exposing the model's private reasoning as visible output).
     const anthropicPayload: AnthropicMessagesPayload = {
       model: "claude-3-5-sonnet-20241022",
       messages: [
@@ -146,17 +150,18 @@ describe("Anthropic to OpenAI translation logic", () => {
     const openAIPayload = translateToOpenAI(anthropicPayload)
     expect(isValidChatCompletionRequest(openAIPayload)).toBe(true)
 
-    // Check that thinking content is combined with text content
     const assistantMessage = openAIPayload.messages.find(
       (m) => m.role === "assistant",
     )
-    expect(assistantMessage?.content).toContain(
-      "Let me think about this simple math problem...",
-    )
+    // Text block preserved.
     expect(assistantMessage?.content).toContain("2+2 equals 4.")
+    // Thinking block dropped — must not leak into outgoing payload.
+    expect(JSON.stringify(assistantMessage)).not.toContain(
+      "Let me think about this simple math problem",
+    )
   })
 
-  test("should handle thinking blocks with tool calls", () => {
+  test("should drop thinking blocks but preserve text and tool calls", () => {
     const anthropicPayload: AnthropicMessagesPayload = {
       model: "claude-3-5-sonnet-20241022",
       messages: [
@@ -184,13 +189,14 @@ describe("Anthropic to OpenAI translation logic", () => {
     const openAIPayload = translateToOpenAI(anthropicPayload)
     expect(isValidChatCompletionRequest(openAIPayload)).toBe(true)
 
-    // Check that thinking content is included in the message content
     const assistantMessage = openAIPayload.messages.find(
       (m) => m.role === "assistant",
     )
-    expect(assistantMessage?.content).toContain(
+    // Thinking block dropped.
+    expect(JSON.stringify(assistantMessage)).not.toContain(
       "I need to call the weather API",
     )
+    // Text and tool calls preserved.
     expect(assistantMessage?.content).toContain(
       "I'll check the weather for you.",
     )

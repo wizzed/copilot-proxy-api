@@ -10,7 +10,11 @@ export function mapOpenAIStopReasonToAnthropic(
     stop: "end_turn",
     length: "max_tokens",
     tool_calls: "tool_use",
-    content_filter: "end_turn",
+    // Anthropic's spec uses "refusal" when the model declines to respond
+    // due to safety/content policy. Map Copilot's "content_filter" to that
+    // so Claude Code can surface a meaningful UX (it has a special render
+    // path for refusal blocks).
+    content_filter: "refusal",
   } as const
   return stopReasonMap[finishReason]
 }

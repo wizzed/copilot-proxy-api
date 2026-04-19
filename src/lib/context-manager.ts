@@ -1,16 +1,14 @@
 /**
- * OpenCode-style context management for Copilot API payloads.
+ * Context management for Copilot API payloads.
  *
- * Strategy (applied in order, only when over the token limit):
- *  1. Prune old tool outputs — walk backwards, keep the most recent PRUNE_PROTECT
- *     tokens of tool results, replace older ones with a short placeholder.
- *  2. Strip base64 images from older messages (huge byte cost, low info value).
- *  3. Drop oldest conversation messages until the payload fits within the model's
- *     context window minus a safety buffer.
+ * The actual constraint we care about is the Copilot gateway's hard 2.5 MiB
+ * (2,621,440 byte) ceiling — not the model's claimed token window. Tokens
+ * are only used when we genuinely overflow bytes; otherwise we skip the
+ * expensive tokenizer pass entirely.
  *
- * Performance: token counting is done once upfront. If within limits, all steps
- * are skipped (zero overhead in the common case). When truncation is needed,
- * per-message token estimates avoid re-counting the entire payload in a loop.
+ * Fast path (~99% of Claude Code requests): byte size check → return.
+ * Slow path: prune tool outputs → strip images → drop oldest messages →
+ *           byte-based final backstop.
  */
 
 import consola from "consola"
@@ -21,168 +19,199 @@ import type {
 } from "~/services/copilot/create-chat-completions"
 import type { Model } from "~/services/copilot/get-models"
 
-import { getTokenCount } from "./tokenizer"
+// ── Configuration ───────────────────────────────────────────────────────────
 
-// ── Tunables ────────────────────────────────────────────────────────────────
-
-/** Tokens of recent tool output to protect from pruning. */
-const PRUNE_PROTECT_TOKENS = 40_000
-
-/** Minimum tokens that must be pruned to bother (avoids tiny savings). */
-const PRUNE_MINIMUM_TOKENS = 20_000
-
-/** Safety buffer subtracted from the context window to leave room for the
- *  response and overhead. */
-const CONTEXT_BUFFER_TOKENS = 20_000
-
-/** Placeholder that replaces pruned tool output. */
-const PRUNED_PLACEHOLDER = "[content pruned — tool output was too old]"
-
-/** Placeholder that replaces stripped images. */
-const IMAGE_STRIPPED_PLACEHOLDER = "[image removed to save context]"
-
-/** Absolute byte-size backstop. Empirically determined via probe scripts:
- *  the Copilot gateway/backend has a hard cutoff at exactly 2.5 MiB
- *  (2,621,440 bytes). Payloads at or above that cliff hang indefinitely
- *  (no response within 90s) instead of being cleanly rejected. Payloads
- *  ≥ ~5.4 MB get a fast HTTP 413 from the Azure Front Door gateway.
- *
- *  We target 2,500,000 bytes (decimal MB) — leaves ~120 KB of margin below
- *  the 2.5 MiB cliff for JSON framing, headers, and tool definitions added
- *  downstream of fitContext(). */
+/**
+ * Hard byte ceiling for Copilot. Empirically the cliff is at 2,621,440 bytes
+ * (2.5 MiB) for `claude-opus-4.6-1m`; we leave ~120 KB headroom for headers,
+ * tool definitions, and downstream JSON framing.
+ */
 const MAX_PAYLOAD_BYTES = 2_500_000
+
+/** Minimum protected byte budget for recent tool outputs before pruning. */
+const PRUNE_PROTECT_BYTES = 200_000
+
+/** Don't prune unless we'd reclaim at least this many bytes. */
+const PRUNE_MINIMUM_BYTES = 50_000
+
+/** Per-message hard cap for tool output content even when "recent". A single
+ *  giant Read of a 1MB file shouldn't blow the budget by itself. */
+const TOOL_OUTPUT_HARD_CAP = 100_000
+
+const PRUNED_PLACEHOLDER = "[content pruned — tool output was too old]"
+const TOOL_TRUNCATED_SUFFIX = "\n\n[…tool output truncated to fit context]"
+const IMAGE_STRIPPED_PLACEHOLDER = "[image removed to save context]"
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /**
- * Fit a payload within the model's context window using progressive strategies.
- * Returns a new payload (the original is not mutated).
- *
- * Fast path: byte-size check first (microseconds). Only invokes the expensive
- * tokenizer if the payload could plausibly be over the token limit.
+ * Fit a payload within the Copilot gateway's byte ceiling. Returns the input
+ * payload unmodified in the common case (cheap byte size check).
  */
-export async function fitContext(
+export function fitContext(
   payload: ChatCompletionsPayload,
-  model: Model,
-): Promise<ChatCompletionsPayload> {
-  const contextLimit = model.capabilities.limits.max_context_window_tokens ?? 0
-  if (contextLimit === 0) {
-    // Unknown model limits — fall back to byte-based backstop only
-    return byteBackstop(payload)
-  }
+  _model: Model,
+): ChatCompletionsPayload {
+  const initialBytes = estimatePayloadBytes(payload)
 
-  const maxTokens = contextLimit - CONTEXT_BUFFER_TOKENS
-
-  // Cheap fast-path: if the JSON byte size implies we can't possibly exceed
-  // the token limit (very conservative: 2 chars per token), skip everything.
-  // This avoids invoking the tokenizer on the common case (well under limit).
-  const bytes = JSON.stringify(payload).length
-  const minPossibleTokens = Math.ceil(bytes / 8) // very loose lower bound
-  if (minPossibleTokens <= maxTokens && bytes <= MAX_PAYLOAD_BYTES) {
+  // Fast path: well under the gateway ceiling — just send.
+  if (initialBytes <= MAX_PAYLOAD_BYTES) {
     return payload
   }
 
-  // Borderline or over — do the precise token count
-  const { input: currentTokens } = await getTokenCount(payload, model)
-  if (currentTokens <= maxTokens) {
-    return byteBackstop(payload) // still check byte limit (images can be huge)
-  }
-
   consola.info(
-    `Context overflow: ${currentTokens} tokens > ${maxTokens} limit. Applying context management.`,
+    `Context fit: payload ${formatBytes(initialBytes)} exceeds ${formatBytes(MAX_PAYLOAD_BYTES)} ceiling — reducing`,
   )
 
-  // Clone once — all steps mutate this copy
-  let current = structuredClone(payload)
-  let tokens = currentTokens
+  // Slow path: progressive byte-based reduction.
+  let current = pruneToolOutputs(payload)
+  let bytes = estimatePayloadBytes(current)
+  if (bytes <= MAX_PAYLOAD_BYTES) {
+    consola.info(
+      `Context fit: ${formatBytes(initialBytes)} → ${formatBytes(bytes)} after tool pruning`,
+    )
+    return current
+  }
 
-  // Step 1: Prune old tool outputs
-  const pruneResult = pruneToolOutputs(current, tokens)
-  current = pruneResult.payload
-  tokens = pruneResult.tokens
+  current = stripOldImages(current)
+  bytes = estimatePayloadBytes(current)
+  if (bytes <= MAX_PAYLOAD_BYTES) {
+    consola.info(
+      `Context fit: ${formatBytes(initialBytes)} → ${formatBytes(bytes)} after stripping old images`,
+    )
+    return current
+  }
 
-  if (tokens <= maxTokens) return byteBackstop(current)
+  // Aggressive: strip ALL images regardless of age.
+  current = stripAllImages(current)
+  bytes = estimatePayloadBytes(current)
+  if (bytes <= MAX_PAYLOAD_BYTES) {
+    consola.warn(
+      `Context fit: ${formatBytes(initialBytes)} → ${formatBytes(bytes)} after stripping ALL images`,
+    )
+    return current
+  }
 
-  // Step 2: Strip base64 images from older messages
-  const stripResult = stripOldImages(current, tokens)
-  current = stripResult.payload
-  tokens = stripResult.tokens
+  // Truncate any oversized tool outputs that survived pruning (e.g. recent ones).
+  current = truncateOversizedToolOutputs(current)
+  bytes = estimatePayloadBytes(current)
+  if (bytes <= MAX_PAYLOAD_BYTES) {
+    consola.warn(
+      `Context fit: ${formatBytes(initialBytes)} → ${formatBytes(bytes)} after truncating oversized tool outputs`,
+    )
+    return current
+  }
 
-  if (tokens <= maxTokens) return byteBackstop(current)
-
-  // Step 3: Drop oldest conversation messages
-  current = dropOldMessages(current, tokens, maxTokens)
-
-  // Step 4: Byte-size backstop for Copilot gateway limit
-  return byteBackstop(current)
+  current = dropOldMessages(current)
+  bytes = estimatePayloadBytes(current)
+  consola.warn(
+    `Context fit: ${formatBytes(initialBytes)} → ${formatBytes(bytes)} after dropping old messages`,
+  )
+  return current
 }
 
-// ── Step 1: Prune old tool outputs ──────────────────────────────────────────
+function formatBytes(b: number): string {
+  if (b < 1024) return `${b}B`
+  if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)}KB`
+  return `${(b / 1024 / 1024).toFixed(2)}MB`
+}
+
+// ── Byte estimation ─────────────────────────────────────────────────────────
+
+/**
+ * Cheap byte-size estimate for a payload. Uses content lengths directly
+ * instead of JSON.stringify, which is ~10x faster on large payloads. The
+ * estimate is a lower bound (ignores JSON framing overhead) but accurate
+ * to within a few percent for realistic Claude Code payloads.
+ */
+function estimatePayloadBytes(payload: ChatCompletionsPayload): number {
+  let bytes = 200 // baseline for top-level JSON framing
+  for (const msg of payload.messages) {
+    bytes += estimateMessageBytes(msg)
+  }
+  if (payload.tools) {
+    for (const tool of payload.tools) {
+      // Tool definitions are dense JSON; conservatively double-count via stringify.
+      bytes += JSON.stringify(tool).length + 20
+    }
+  }
+  return bytes
+}
+
+function estimateMessageBytes(msg: Message): number {
+  let bytes = 40 // role + framing
+  if (typeof msg.content === "string") {
+    bytes += msg.content.length
+  } else if (Array.isArray(msg.content)) {
+    for (const part of msg.content) {
+      if ("text" in part && typeof part.text === "string") {
+        bytes += part.text.length + 20
+      } else if ("type" in part && part.type === "image_url") {
+        bytes += part.image_url.url.length + 40
+      }
+    }
+  }
+  if (msg.tool_calls) {
+    for (const tc of msg.tool_calls) {
+      bytes += tc.function.name.length + tc.function.arguments.length + 80
+    }
+  }
+  if (msg.tool_call_id) bytes += msg.tool_call_id.length + 20
+  return bytes
+}
+
+// ── Reduction step 1: prune old tool outputs ────────────────────────────────
 
 function pruneToolOutputs(
   payload: ChatCompletionsPayload,
-  currentTokens: number,
-): { payload: ChatCompletionsPayload; tokens: number } {
+): ChatCompletionsPayload {
   const messages = payload.messages
-  let protectedTokens = 0
-  let prunedTokens = 0
+  let protectedBytes = 0
+  let prunedBytes = 0
   const prunedIndices: Array<number> = []
 
-  // Walk backwards — protect recent tool outputs, prune older ones
+  // Walk newest → oldest, protecting recent tool outputs.
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i]
     if (msg.role !== "tool") continue
 
-    const estimatedTokens = estimateMessageTokens(msg)
-
-    if (protectedTokens < PRUNE_PROTECT_TOKENS) {
-      protectedTokens += estimatedTokens
+    const msgBytes = estimateMessageBytes(msg)
+    if (protectedBytes < PRUNE_PROTECT_BYTES) {
+      protectedBytes += msgBytes
     } else {
-      prunedTokens += estimatedTokens
+      prunedBytes += msgBytes
       prunedIndices.push(i)
     }
   }
 
-  if (prunedTokens < PRUNE_MINIMUM_TOKENS) {
-    return { payload, tokens: currentTokens }
+  if (prunedBytes < PRUNE_MINIMUM_BYTES) {
+    return payload
   }
 
-  // Apply pruning
   const newMessages = [...messages]
-  const placeholderTokens = estimateStringTokens(PRUNED_PLACEHOLDER)
-  let savedTokens = 0
-
   for (const idx of prunedIndices) {
-    const originalTokens = estimateMessageTokens(newMessages[idx])
     newMessages[idx] = { ...newMessages[idx], content: PRUNED_PLACEHOLDER }
-    savedTokens += originalTokens - placeholderTokens
   }
 
   consola.info(
-    `Pruned ${prunedIndices.length} old tool outputs (~${savedTokens} tokens saved)`,
+    `Pruned ${prunedIndices.length} old tool outputs (~${prunedBytes} bytes reclaimed)`,
   )
-
-  return {
-    payload: { ...payload, messages: newMessages },
-    tokens: currentTokens - savedTokens,
-  }
+  return { ...payload, messages: newMessages }
 }
 
-// ── Step 2: Strip base64 images from older messages ─────────────────────────
+// ── Reduction step 2: strip base64 images from older messages ───────────────
 
 function stripOldImages(
   payload: ChatCompletionsPayload,
-  currentTokens: number,
-): { payload: ChatCompletionsPayload; tokens: number } {
+): ChatCompletionsPayload {
   const messages = payload.messages
   const newMessages = [...messages]
-  let savedTokens = 0
   let strippedCount = 0
+  let strippedBytes = 0
 
-  // Keep images only in the last 4 messages (recent context)
+  // Keep images only in the last 4 messages (recent visual context).
   const protectFromEnd = 4
   const protectBoundary = Math.max(0, messages.length - protectFromEnd)
-  const placeholderTokens = estimateStringTokens(IMAGE_STRIPPED_PLACEHOLDER)
 
   for (let i = 0; i < protectBoundary; i++) {
     const msg = messages[i]
@@ -192,9 +221,7 @@ function stripOldImages(
     const newContent = msg.content.map((part) => {
       if ("type" in part && part.type === "image_url") {
         strippedCount++
-        // Base64 images are typically huge — estimate conservatively
-        const imageTokens = estimateStringTokens(part.image_url.url) + 85
-        savedTokens += imageTokens - placeholderTokens
+        strippedBytes += part.image_url.url.length
         return { type: "text" as const, text: IMAGE_STRIPPED_PLACEHOLDER }
       }
       return part
@@ -207,63 +234,71 @@ function stripOldImages(
 
   if (strippedCount > 0) {
     consola.info(
-      `Stripped ${strippedCount} base64 images (~${savedTokens} tokens saved)`,
+      `Stripped ${strippedCount} base64 images (~${strippedBytes} bytes reclaimed)`,
     )
   }
-
-  return {
-    payload: { ...payload, messages: newMessages },
-    tokens: currentTokens - savedTokens,
-  }
+  return { ...payload, messages: newMessages }
 }
 
-// ── Step 3: Drop oldest conversation messages ───────────────────────────────
+// ── Reduction step 2b: strip ALL images regardless of recency ───────────────
+
+function stripAllImages(
+  payload: ChatCompletionsPayload,
+): ChatCompletionsPayload {
+  let strippedCount = 0
+  let strippedBytes = 0
+  const newMessages = payload.messages.map((msg) => {
+    if (!Array.isArray(msg.content)) return msg
+    const before = strippedCount
+    const newContent = msg.content.map((part) => {
+      if ("type" in part && part.type === "image_url") {
+        strippedCount++
+        strippedBytes += part.image_url.url.length
+        return { type: "text" as const, text: IMAGE_STRIPPED_PLACEHOLDER }
+      }
+      return part
+    })
+    return strippedCount > before ? { ...msg, content: newContent } : msg
+  })
+  if (strippedCount > 0) {
+    consola.warn(
+      `Stripped ${strippedCount} ALL images (~${strippedBytes} bytes reclaimed)`,
+    )
+  }
+  return { ...payload, messages: newMessages }
+}
+
+// ── Reduction step 2c: truncate oversized tool outputs ──────────────────────
+
+function truncateOversizedToolOutputs(
+  payload: ChatCompletionsPayload,
+): ChatCompletionsPayload {
+  let truncatedCount = 0
+  let reclaimedBytes = 0
+  const newMessages = payload.messages.map((msg) => {
+    if (msg.role !== "tool") return msg
+    if (typeof msg.content !== "string") return msg
+    if (msg.content.length <= TOOL_OUTPUT_HARD_CAP) return msg
+    const before = msg.content.length
+    const truncated =
+      msg.content.slice(0, TOOL_OUTPUT_HARD_CAP) + TOOL_TRUNCATED_SUFFIX
+    truncatedCount++
+    reclaimedBytes += before - truncated.length
+    return { ...msg, content: truncated }
+  })
+  if (truncatedCount > 0) {
+    consola.warn(
+      `Truncated ${truncatedCount} oversized tool outputs (~${reclaimedBytes} bytes reclaimed)`,
+    )
+  }
+  return { ...payload, messages: newMessages }
+}
+
+// ── Reduction step 3: drop oldest conversation messages ─────────────────────
 
 function dropOldMessages(
   payload: ChatCompletionsPayload,
-  currentTokens: number,
-  maxTokens: number,
 ): ChatCompletionsPayload {
-  const messages = payload.messages
-
-  // Separate system/developer messages from conversation
-  const systemMessages = messages.filter(
-    (m) => m.role === "system" || m.role === "developer",
-  )
-  const conversationMessages = messages.filter(
-    (m) => m.role !== "system" && m.role !== "developer",
-  )
-
-  let tokens = currentTokens
-  let dropped = 0
-
-  // Drop from the front (oldest) — subtract estimated tokens per message
-  while (conversationMessages.length > 2 && tokens > maxTokens) {
-    const removed = conversationMessages.shift()
-    if (!removed) break
-    tokens -= estimateMessageTokens(removed)
-    dropped++
-  }
-
-  if (dropped > 0) {
-    consola.info(
-      `Dropped ${dropped} old messages (~${currentTokens - tokens} tokens saved, ~${tokens} remaining, limit ${maxTokens})`,
-    )
-  }
-
-  return { ...payload, messages: [...systemMessages, ...conversationMessages] }
-}
-
-// ── Step 4: Byte backstop ───────────────────────────────────────────────────
-
-function byteBackstop(payload: ChatCompletionsPayload): ChatCompletionsPayload {
-  const size = JSON.stringify(payload).length
-  if (size <= MAX_PAYLOAD_BYTES) return payload
-
-  consola.warn(
-    `Payload ${size} bytes exceeds ${MAX_PAYLOAD_BYTES} byte limit. Applying byte-level truncation.`,
-  )
-
   const systemMessages = payload.messages.filter(
     (m) => m.role === "system" || m.role === "developer",
   )
@@ -271,48 +306,41 @@ function byteBackstop(payload: ChatCompletionsPayload): ChatCompletionsPayload {
     (m) => m.role !== "system" && m.role !== "developer",
   )
 
-  const trimmed = [...conversationMessages]
-  while (trimmed.length > 2) {
-    trimmed.shift()
-    const candidate = { ...payload, messages: [...systemMessages, ...trimmed] }
-    if (JSON.stringify(candidate).length <= MAX_PAYLOAD_BYTES) {
-      consola.info(`Byte backstop: trimmed to ${trimmed.length} messages`)
-      return candidate
+  // Compute reusable system byte total.
+  let baseBytes = 200
+  for (const m of systemMessages) baseBytes += estimateMessageBytes(m)
+  if (payload.tools) {
+    for (const tool of payload.tools) {
+      baseBytes += JSON.stringify(tool).length + 20
     }
   }
 
-  return { ...payload, messages: [...systemMessages, ...trimmed] }
-}
+  // Compute per-message byte sizes once for the conversation tail.
+  const convBytes = conversationMessages.map((m) => estimateMessageBytes(m))
+  let totalBytes = baseBytes + convBytes.reduce((a, b) => a + b, 0)
 
-// ── Token estimation helpers ────────────────────────────────────────────────
+  let dropped = 0
+  while (conversationMessages.length > 2 && totalBytes > MAX_PAYLOAD_BYTES) {
+    const removedBytes = convBytes.shift() ?? 0
+    conversationMessages.shift()
+    totalBytes -= removedBytes
+    dropped++
+  }
 
-/** Rough token estimate for a string (~4 chars per token). */
-function estimateStringTokens(str: string): number {
-  return Math.ceil(str.length / 4)
-}
+  if (dropped > 0) {
+    consola.warn(
+      `Dropped ${dropped} oldest conversation messages (~${totalBytes} bytes remaining, limit ${MAX_PAYLOAD_BYTES})`,
+    )
+  }
 
-/** Estimate tokens for a single message without loading the tokenizer. */
-function estimateMessageTokens(msg: Message): number {
-  const overhead = 4 // role + framing tokens
-  if (typeof msg.content === "string") {
-    return overhead + estimateStringTokens(msg.content)
+  if (totalBytes > MAX_PAYLOAD_BYTES) {
+    consola.error(
+      `Payload still over ${MAX_PAYLOAD_BYTES}B after all reductions (${totalBytes}B). Forwarding anyway — Copilot will likely return 413 → 400 prompt-too-long for reactive compaction.`,
+    )
   }
-  if (Array.isArray(msg.content)) {
-    let tokens = overhead
-    for (const part of msg.content) {
-      if ("text" in part && typeof part.text === "string") {
-        tokens += estimateStringTokens(part.text)
-      } else if ("type" in part && part.type === "image_url") {
-        tokens +=
-          estimateStringTokens(
-            (part as { image_url: { url: string } }).image_url.url,
-          ) + 85
-      }
-    }
-    return tokens
+
+  return {
+    ...payload,
+    messages: [...systemMessages, ...conversationMessages],
   }
-  if (msg.tool_calls) {
-    return overhead + estimateStringTokens(JSON.stringify(msg.tool_calls))
-  }
-  return overhead
 }

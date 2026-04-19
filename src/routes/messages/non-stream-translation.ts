@@ -11,11 +11,11 @@ import {
 import {
   type AnthropicAssistantContentBlock,
   type AnthropicAssistantMessage,
+  type AnthropicDocumentBlock,
   type AnthropicMessage,
   type AnthropicMessagesPayload,
   type AnthropicResponse,
   type AnthropicTextBlock,
-  type AnthropicThinkingBlock,
   type AnthropicTool,
   type AnthropicToolResultBlock,
   type AnthropicToolUseBlock,
@@ -44,6 +44,88 @@ export function translateToOpenAI(
     tools: translateAnthropicToolsToOpenAI(payload.tools),
     tool_choice: translateAnthropicToolChoiceToOpenAI(payload.tool_choice),
   }
+}
+
+/**
+ * Pre-process the Anthropic payload to handle async / proxy-side concerns
+ * (currently: PDF document block extraction). Returns a new payload with
+ * `document` blocks replaced by extracted-text blocks.
+ *
+ * Throws HTTPError (Anthropic-shaped) on PDF extraction failure.
+ */
+export async function preprocessAnthropicPayload(
+  payload: AnthropicMessagesPayload,
+): Promise<AnthropicMessagesPayload> {
+  // Fast path: no document blocks anywhere.
+  const hasDocuments = payload.messages.some(
+    (m) =>
+      Array.isArray(m.content) && m.content.some((b) => b.type === "document"),
+  )
+  if (!hasDocuments) return payload
+
+  const newMessages: Array<AnthropicMessage> = []
+  for (const msg of payload.messages) {
+    if (msg.role !== "user" || !Array.isArray(msg.content)) {
+      newMessages.push(msg)
+      continue
+    }
+    const newContent: Array<AnthropicUserContentBlock> = []
+    for (const block of msg.content) {
+      if (block.type === "document") {
+        newContent.push(...(await extractDocumentBlock(block)))
+      } else {
+        newContent.push(block)
+      }
+    }
+    newMessages.push({ role: "user", content: newContent })
+  }
+  return { ...payload, messages: newMessages }
+}
+
+async function extractDocumentBlock(
+  block: AnthropicDocumentBlock,
+): Promise<Array<AnthropicTextBlock>> {
+  // Plain-text document source — just inline.
+  if (block.source.type === "text") {
+    return [
+      {
+        type: "text",
+        text: documentHeader(block) + block.source.data,
+      },
+    ]
+  }
+
+  // URL document source — Copilot can't fetch URLs; skip with note.
+  if (block.source.type === "url") {
+    return [
+      {
+        type: "text",
+        text:
+          documentHeader(block)
+          + `[document at ${block.source.url} not inlined — proxy does not fetch external URLs]`,
+      },
+    ]
+  }
+
+  // base64 PDF — extract via pdf-parse.
+  const { extractPdfText } = await import("~/lib/pdf")
+  const extracted = await extractPdfText(block.source.data)
+  return [
+    {
+      type: "text",
+      text:
+        documentHeader(block)
+        + `[Extracted text from PDF (${extracted.pageCount} page${extracted.pageCount === 1 ? "" : "s"}${extracted.truncated ? ", truncated" : ""}):]\n\n`
+        + extracted.text,
+    },
+  ]
+}
+
+function documentHeader(block: AnthropicDocumentBlock): string {
+  const parts: Array<string> = []
+  if (block.title) parts.push(`Document: ${block.title}`)
+  if (block.context) parts.push(`Context: ${block.context}`)
+  return parts.length > 0 ? parts.join("\n") + "\n\n" : ""
 }
 
 // Exact model name mappings
@@ -208,15 +290,11 @@ function handleAssistantMessage(
     (block): block is AnthropicTextBlock => block.type === "text",
   )
 
-  const thinkingBlocks = message.content.filter(
-    (block): block is AnthropicThinkingBlock => block.type === "thinking",
-  )
-
-  // Combine text and thinking blocks, as OpenAI doesn't have separate thinking blocks
-  const allTextContent = [
-    ...textBlocks.map((b) => b.text),
-    ...thinkingBlocks.map((b) => b.thinking),
-  ].join("\n\n")
+  // Thinking blocks have signed-by-Anthropic semantics that Copilot can't
+  // verify or replay. Promoting their content to plain text would destroy
+  // the assistant turn semantics (the model would treat its own private
+  // reasoning as visible text). Drop them cleanly on the request side.
+  const allTextContent = textBlocks.map((b) => b.text).join("\n\n")
 
   return toolUseBlocks.length > 0 ?
       [
@@ -256,11 +334,8 @@ function mapContent(
   const hasImage = content.some((block) => block.type === "image")
   if (!hasImage) {
     return content
-      .filter(
-        (block): block is AnthropicTextBlock | AnthropicThinkingBlock =>
-          block.type === "text" || block.type === "thinking",
-      )
-      .map((block) => (block.type === "text" ? block.text : block.thinking))
+      .filter((block): block is AnthropicTextBlock => block.type === "text")
+      .map((block) => block.text)
       .join("\n\n")
   }
 
@@ -272,14 +347,7 @@ function mapContent(
 
         break
       }
-      case "thinking": {
-        contentParts.push({
-          type: "text",
-          text: block.thinking,
-        })
-
-        break
-      }
+      // Thinking blocks dropped — see handleAssistantMessage rationale.
       case "image": {
         contentParts.push({
           type: "image_url",
@@ -346,8 +414,12 @@ function translateAnthropicToolChoiceToOpenAI(
 
 // Response translation
 
+// eslint-disable-next-line complexity
 export function translateToAnthropic(
   response: ChatCompletionResponse,
+  /** Original client-requested model id, echoed back so Claude Code displays
+   *  the model the user asked for rather than Copilot's internal id. */
+  clientModel?: string,
 ): AnthropicResponse {
   // Merge content from all choices
   const allTextBlocks: Array<AnthropicTextBlock> = []
@@ -376,7 +448,7 @@ export function translateToAnthropic(
     id: response.id,
     type: "message",
     role: "assistant",
-    model: response.model,
+    model: clientModel ?? response.model,
     content: [...allTextBlocks, ...allToolUseBlocks],
     stop_reason: mapOpenAIStopReasonToAnthropic(stopReason),
     stop_sequence: null,
@@ -416,10 +488,24 @@ function getAnthropicToolUseBlocks(
   if (!toolCalls) {
     return []
   }
-  return toolCalls.map((toolCall) => ({
-    type: "tool_use",
-    id: toolCall.id,
-    name: toolCall.function.name,
-    input: JSON.parse(toolCall.function.arguments) as Record<string, unknown>,
-  }))
+  return toolCalls.map((toolCall) => {
+    let input: Record<string, unknown> = {}
+    try {
+      const parsed = JSON.parse(toolCall.function.arguments) as unknown
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        input = parsed as Record<string, unknown>
+      }
+    } catch {
+      // Copilot can emit malformed JSON for tool args (especially mid-stream
+      // truncation or partial outputs). Fall back to an empty object so the
+      // assistant turn is at least well-formed; Claude Code will surface the
+      // missing args via tool execution failure rather than a hard crash.
+    }
+    return {
+      type: "tool_use",
+      id: toolCall.id,
+      name: toolCall.function.name,
+      input,
+    }
+  })
 }

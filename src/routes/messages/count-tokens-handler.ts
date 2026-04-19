@@ -56,7 +56,11 @@ export async function handleCountTokens(c: Context) {
       }
     }
 
-    let finalTokenCount = tokenCount.input + tokenCount.output
+    // Anthropic's /v1/messages/count_tokens returns INPUT tokens only
+    // (https://docs.anthropic.com/en/api/messages-count-tokens). Including
+    // an estimated output count would mislead Claude Code's auto-compact
+    // accounting (autoCompact.ts uses this to gate when to compact).
+    let finalTokenCount = tokenCount.input
     if (anthropicPayload.model.startsWith("claude")) {
       finalTokenCount = Math.round(finalTokenCount * 1.15)
     } else if (anthropicPayload.model.startsWith("grok")) {
@@ -72,10 +76,11 @@ export async function handleCountTokens(c: Context) {
     consola.error("Error counting tokens:", error)
     return c.json(
       {
-        type: "error",
+        type: "error" as const,
         error: {
           type: "api_error",
-          message: "Failed to count tokens",
+          message:
+            error instanceof Error ? error.message : "Failed to count tokens",
         },
       },
       500,
