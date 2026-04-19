@@ -22,11 +22,31 @@ import type { Model } from "~/services/copilot/get-models"
 // ── Configuration ───────────────────────────────────────────────────────────
 
 /**
- * Hard byte ceiling for Copilot. Empirically the cliff is at 2,621,440 bytes
- * (2.5 MiB) for `claude-opus-4.6-1m`; we leave ~120 KB headroom for headers,
- * tool definitions, and downstream JSON framing.
+ * Hard byte ceiling for Copilot. Empirically the cliff is at ~5.4 MB for
+ * Azure Front Door; we set the proxy ceiling at 5,000,000 to leave ~400 KB
+ * headroom for headers, tool definitions, and downstream JSON framing.
+ *
+ * Why 5 MB and not 2.5 MB (v0.9.1-v0.10.2 value):
+ *   The 2.5 MB ceiling fired aggressively on normal Claude Code sessions
+ *   (typical 6 MB → 0.9 MB prune per turn). The pruned payload causes
+ *   Copilot to report a small prompt_tokens count, which Claude Code uses
+ *   to compute its local context estimate via tokenCountWithEstimation.
+ *   Because Claude Code's local message array still holds the full unpruned
+ *   conversation, its local count climbs by the rough delta each turn until
+ *   it hits the blocking limit (window - 3K) and Claude Code emits
+ *   "Context limit reached" via the preempt path in query.ts:641 — without
+ *   ever calling our proxy, so auto-compact never fires.
+ *
+ *   Raising the ceiling to 5 MB lets normal payloads pass through unmodified.
+ *   Copilot then returns honest prompt_tokens, and Claude Code's auto-compact
+ *   threshold (window - 13K) trips on schedule. Pruning still kicks in as a
+ *   last-resort safety net for genuinely oversized payloads (≥5 MB), which
+ *   is rare in normal Claude Code use.
+ *
+ *   This restores the v0.8.0 behavior (no proxy-side context manager) which
+ *   the user reports worked reliably for auto-compact.
  */
-const MAX_PAYLOAD_BYTES = 2_500_000
+const MAX_PAYLOAD_BYTES = 5_000_000
 
 /** Minimum protected byte budget for recent tool outputs before pruning. */
 const PRUNE_PROTECT_BYTES = 200_000
