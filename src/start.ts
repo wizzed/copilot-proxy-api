@@ -117,6 +117,12 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   serve({
     fetch: server.fetch as ServerHandler,
     port: options.port,
+    // Bun's HTTP server defaults to a 10s idleTimeout, which closes the
+    // client socket while we're still waiting on Copilot's upstream
+    // response (Copilot can take 10-60s for large opus requests). Setting
+    // to 0 disables the idle timeout entirely. Claude Code reports this
+    // as "API Error: The socket connection was closed unexpectedly".
+    bun: { idleTimeout: 0 },
   })
 }
 
