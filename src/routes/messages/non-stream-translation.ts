@@ -1,3 +1,4 @@
+import { state } from "~/lib/state"
 import {
   type ChatCompletionResponse,
   type ChatCompletionsPayload,
@@ -128,60 +129,88 @@ function documentHeader(block: AnthropicDocumentBlock): string {
   return parts.length > 0 ? parts.join("\n") + "\n\n" : ""
 }
 
-// Exact model name mappings
-const MODEL_NAME_MAP: Record<string, string> = {
+// Static fallback mappings, used when state.models hasn't loaded or the
+// dynamic resolver can't find a family match.
+const MODEL_NAME_FALLBACK: Record<string, string> = {
   haiku: "claude-haiku-4.5",
   sonnet: "claude-sonnet-4",
   opus: "claude-opus-4.6-1m",
-  "claude-opus-4": "claude-opus-4.6-1m",
-  "claude-opus-4-0": "claude-opus-4.6-1m",
-  "claude-opus-4-1": "claude-opus-4.6-1m",
-  "claude-opus-4-5": "claude-opus-4.6-1m",
-  "claude-opus-4.5": "claude-opus-4.6-1m",
-  "claude-opus-4.6-1m": "claude-opus-4.6-1m",
-  "claude-sonnet-4-0": "claude-sonnet-4",
-  "claude-sonnet-4-5": "claude-sonnet-4",
-  "claude-sonnet-4.5": "claude-sonnet-4",
-  "claude-sonnet-4-6": "claude-sonnet-4",
-  "claude-haiku-4": "claude-haiku-4.5",
-  "claude-haiku-4-5": "claude-haiku-4.5",
 }
 
-// Pattern-based model mappings: [pattern, target]
-const MODEL_PATTERN_MAP: Array<[string, string]> = [
-  // Claude 3.5 models (older naming convention)
-  ["claude-3-5-sonnet", "claude-sonnet-4"],
-  ["claude-3.5-sonnet", "claude-sonnet-4"],
-  ["claude-3-5-haiku", "claude-haiku-4.5"],
-  ["claude-3.5-haiku", "claude-haiku-4.5"],
-  ["claude-3-opus", "claude-opus-4.6-1m"],
-  ["claude-3.0-opus", "claude-opus-4.6-1m"],
-  // Claude 4.x models with version suffixes (e.g., claude-sonnet-4-20241022)
-  ["claude-sonnet-4-", "claude-sonnet-4"],
-  ["claude-sonnet-4.", "claude-sonnet-4"],
-  ["claude-opus-4-", "claude-opus-4.6-1m"],
-  ["claude-opus-4.", "claude-opus-4.6-1m"],
-  ["claude-haiku-4-", "claude-haiku-4.5"],
-  ["claude-haiku-4.", "claude-haiku-4.5"],
-  // Claude 4.6 models (including 1M context variants)
-  ["claude-opus-4.6", "claude-opus-4.6-1m"],
-  ["claude-sonnet-4.6", "claude-sonnet-4"],
-]
+const CLAUDE_FAMILIES = ["opus", "sonnet", "haiku"] as const
+type ClaudeFamily = (typeof CLAUDE_FAMILIES)[number]
+
+/** Detect which Claude family a requested model name belongs to.
+ *  Handles all the shapes Claude Code emits: bare (`claude-opus-4-5`),
+ *  dated (`claude-opus-4-5-20251101`), AWS (`claude-opus-4-5@20251101`),
+ *  Bedrock (`claude-opus-4-5-20251101-v1:0`), short alias (`opus`), etc. */
+function detectFamily(model: string): ClaudeFamily | null {
+  const lower = model.toLowerCase()
+  for (const family of CLAUDE_FAMILIES) {
+    if (lower.includes(family)) return family
+  }
+  return null
+}
+
+/** Parse a numeric version tuple from a Copilot model id like
+ *  `claude-opus-4.7` → [4, 7]. Returns [0, 0] if no version found. */
+function parseCopilotVersion(id: string): [number, number] {
+  const match = /(\d+)\.(\d+)/.exec(id)
+  if (!match) return [0, 0]
+  return [Number(match[1]), Number(match[2])]
+}
+
+/** Pick the best Copilot model in a family from state.models.
+ *  Highest version wins; among equal versions, prefer the `-1m` variant. */
+function pickLatestCopilotModel(family: ClaudeFamily): string | null {
+  const candidates =
+    state.models?.data.filter((m) => m.id.toLowerCase().includes(family)) ?? []
+  if (candidates.length === 0) return null
+
+  let best = candidates[0]
+  let bestVersion = parseCopilotVersion(best.id)
+  let bestIs1m = best.id.includes("-1m")
+
+  for (const m of candidates.slice(1)) {
+    const v = parseCopilotVersion(m.id)
+    const is1m = m.id.includes("-1m")
+    const newer =
+      v[0] > bestVersion[0]
+      || (v[0] === bestVersion[0] && v[1] > bestVersion[1])
+    const sameVersionPrefer1m =
+      v[0] === bestVersion[0] && v[1] === bestVersion[1] && is1m && !bestIs1m
+    if (newer || sameVersionPrefer1m) {
+      best = m
+      bestVersion = v
+      bestIs1m = is1m
+    }
+  }
+  return best.id
+}
 
 function translateModelName(model: string): string {
-  // Claude Code uses Anthropic model IDs, but GitHub Copilot uses different naming
-  // Map common Claude Code model names to GitHub Copilot equivalents
+  // Claude Code uses Anthropic model IDs (e.g. claude-opus-4-5-20251101);
+  // Copilot uses version-only names (e.g. claude-opus-4.7). We resolve
+  // dynamically against the live model list so new Copilot versions
+  // (4.8, 5.x, …) are picked up automatically.
 
-  // Check exact matches first
-  if (MODEL_NAME_MAP[model]) {
-    return MODEL_NAME_MAP[model]
+  // 1. Already a valid Copilot model id → pass through unchanged.
+  if (state.models?.data.some((m) => m.id === model)) {
+    return model
   }
 
-  // Check pattern-based matches
-  for (const [pattern, target] of MODEL_PATTERN_MAP) {
-    if (model.includes(pattern)) {
-      return target
-    }
+  // 2. Detect family and route to the latest available Copilot model in
+  //    that family. This replaces the previously-hardcoded mappings that
+  //    silently downgraded newer versions to claude-opus-4.6-1m.
+  const family = detectFamily(model)
+  if (family) {
+    const latest = pickLatestCopilotModel(family)
+    if (latest) return latest
+  }
+
+  // 3. Static fallback for short aliases when state.models hasn't loaded.
+  if (MODEL_NAME_FALLBACK[model]) {
+    return MODEL_NAME_FALLBACK[model]
   }
 
   return model
