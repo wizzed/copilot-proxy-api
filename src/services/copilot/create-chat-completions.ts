@@ -53,24 +53,37 @@ export const createChatCompletions = async (
       || /context_length_exceeded/i.test(errorBody)
 
     if (isContextOverflow) {
+      // Return HTTP 400 with "prompt is too long" so Claude Code's reactive
+      // compaction kicks in (verified from Claude Code source: services/api/
+      // errors.ts triggers tryReactiveCompact on this exact phrase). Returning
+      // 529/overloaded_error would only trigger retry-with-backoff (3 attempts
+      // then fatal "Repeated 529 Overloaded errors").
+      //
+      // Token estimate: bytes/4 is a rough but conservative approximation.
+      // Claude Code uses the gap (estimatedTokens - modelLimit) to decide how
+      // many message groups to peel in a single compaction pass.
+      const estimatedTokens = Math.ceil(body.length / 4)
+      const modelLimit =
+        state.models?.data.find((m) => m.id === payload.model)?.capabilities
+          .limits.max_context_window_tokens ?? 200_000
+
       consola.warn(
-        "Context overflow detected — signaling overloaded_error to client",
+        `Context overflow → returning 400 prompt-too-long (~${estimatedTokens} > ${modelLimit}) to trigger Claude Code reactive compaction`,
       )
-      // Return an Anthropic-compatible overloaded_error so Claude Code
-      // knows to compact/retry rather than treating it as a fatal error
+
       throw new HTTPError(
-        "Context overflow",
+        "Prompt too long",
         new Response(
           JSON.stringify({
             type: "error",
             error: {
-              type: "overloaded_error",
-              message: `Request too large for Copilot API (${body.length} bytes). Context overflow detected.`,
+              type: "invalid_request_error",
+              message: `prompt is too long: ${estimatedTokens} tokens > ${modelLimit} maximum`,
             },
           }),
           {
-            status: 529,
-            statusText: "Overloaded",
+            status: 400,
+            statusText: "Bad Request",
             headers: { "content-type": "application/json" },
           },
         ),
