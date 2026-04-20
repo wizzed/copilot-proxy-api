@@ -74,15 +74,30 @@ export const createChatCompletions = async (
       // Token estimate: bytes/4 is a rough but conservative approximation.
       // Claude Code uses the gap (estimatedTokens - modelLimit) to decide how
       // many message groups to peel in a single compaction pass.
+      //
+      // Use max_prompt_tokens (the field Copilot actually enforces — e.g.
+      // 168K for opus-4.7) rather than max_context_window_tokens (the
+      // total window incl. output, ≥200K). Falling back to the larger field
+      // and finally 200K preserves behavior for models lacking metadata.
       const estimatedTokens = Math.ceil(body.length / 4)
+      const modelCaps = state.models?.data.find((m) => m.id === payload.model)
+        ?.capabilities.limits
       const modelLimit =
-        state.models?.data.find((m) => m.id === payload.model)?.capabilities
-          .limits.max_context_window_tokens ?? 200_000
+        modelCaps?.max_prompt_tokens
+        ?? modelCaps?.max_context_window_tokens
+        ?? 200_000
+      const maxOutputTokens = payload.max_tokens ?? 0
 
       consola.warn(
-        `Context overflow → returning 400 prompt-too-long (~${estimatedTokens} > ${modelLimit}) to trigger Claude Code reactive compaction`,
+        `Context overflow → returning 400 prompt-too-long (~${estimatedTokens} + ${maxOutputTokens} > ${modelLimit}) to trigger Claude Code reactive compaction`,
       )
 
+      // Message format satisfies BOTH Claude Code recovery paths:
+      //   1. substring "prompt is too long" → tryReactiveCompact (compact.ts)
+      //   2. regex "input length and `max_tokens` exceed context limit:
+      //      (\d+) \+ (\d+) > (\d+)" → parseMaxTokensContextOverflowError
+      //      (withRetry.ts), which auto-shrinks max_tokens and retries
+      //      cleanly without throwing away history.
       throw new HTTPError(
         "Prompt too long",
         new Response(
@@ -90,7 +105,7 @@ export const createChatCompletions = async (
             type: "error",
             error: {
               type: "invalid_request_error",
-              message: `prompt is too long: ${estimatedTokens} tokens > ${modelLimit} maximum`,
+              message: `prompt is too long: input length and \`max_tokens\` exceed context limit: ${estimatedTokens} + ${maxOutputTokens} > ${modelLimit} tokens`,
             },
           }),
           {

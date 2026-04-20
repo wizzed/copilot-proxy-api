@@ -1,10 +1,13 @@
 /**
  * Context management for Copilot API payloads.
  *
- * The actual constraint we care about is the Copilot gateway's hard 2.5 MiB
- * (2,621,440 byte) ceiling — not the model's claimed token window. Tokens
- * are only used when we genuinely overflow bytes; otherwise we skip the
- * expensive tokenizer pass entirely.
+ * Enforces TWO ceilings, whichever is smaller for a given model:
+ *   1. Hard byte ceiling (~5 MB) — Copilot's Azure Front Door cliff
+ *   2. Token-derived byte ceiling — model's max_prompt_tokens × 3.5 chars
+ *
+ * The token-derived ceiling prevents `model_max_prompt_tokens_exceeded`
+ * rejections on models with stricter caps (e.g. opus-4.7 = 168K tokens),
+ * which a 1 MB payload can easily breach.
  *
  * Fast path (~99% of Claude Code requests): byte size check → return.
  * Slow path: prune tool outputs → strip images → drop oldest messages →
@@ -58,6 +61,25 @@ const PRUNE_MINIMUM_BYTES = 50_000
  *  giant Read of a 1MB file shouldn't blow the budget by itself. */
 const TOOL_OUTPUT_HARD_CAP = 100_000
 
+/**
+ * Empirical chars/token ratio for Claude Code payloads. Used to derive a
+ * byte ceiling from the model's `max_prompt_tokens` without paying for a
+ * real tokenizer pass. Real ratios on typical code-heavy Claude Code traffic
+ * sit in the 3.0-3.8 range (English prose ~4.0, dense code ~3.0). We pick
+ * 3.5 as a slightly conservative midpoint — it errs toward pruning a touch
+ * earlier rather than letting Copilot reject. Cost: one multiplication per
+ * request vs. ~300-1000ms for a real tokenizer pass on the hot path.
+ */
+const CHARS_PER_TOKEN_ESTIMATE = 3.5
+
+/**
+ * Reserve this many tokens under max_prompt_tokens for max_tokens output and
+ * Copilot framing overhead (function-call encoding, message-wrapping tokens).
+ * Copilot's reported prompt_token count typically runs a few thousand higher
+ * than ours due to encoding differences; this buffer absorbs that skew.
+ */
+const TOKEN_RESERVE = 8_000
+
 const PRUNED_PLACEHOLDER = "[content pruned — tool output was too old]"
 const TOOL_TRUNCATED_SUFFIX = "\n\n[…tool output truncated to fit context]"
 const IMAGE_STRIPPED_PLACEHOLDER = "[image removed to save context]"
@@ -65,28 +87,56 @@ const IMAGE_STRIPPED_PLACEHOLDER = "[image removed to save context]"
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /**
- * Fit a payload within the Copilot gateway's byte ceiling. Returns the input
+ * Compute the effective byte ceiling for a given model.
+ *
+ * The proxy enforces TWO ceilings and uses whichever is smaller:
+ *
+ *   1. The hard byte ceiling MAX_PAYLOAD_BYTES (~5 MB) — Copilot's Azure
+ *      Front Door rejects payloads >5.4 MB regardless of token count.
+ *
+ *   2. A token-derived byte ceiling — Copilot ALSO rejects when the
+ *      tokenized prompt exceeds the model's `max_prompt_tokens` cap, which
+ *      varies per model (e.g. claude-opus-4.7 = 168K, others = 200K). A 1 MB
+ *      payload on opus-4.7 can easily contain 169K tokens and get rejected
+ *      with `model_max_prompt_tokens_exceeded`. To prevent that, we estimate
+ *      a byte budget from the token cap using a fixed chars/token ratio.
+ *
+ * If `max_prompt_tokens` is missing from model metadata, we fall back to
+ * MAX_PAYLOAD_BYTES alone (existing behavior, no regression).
+ */
+function computeEffectiveCeiling(model: Model): number {
+  const maxPromptTokens = model.capabilities.limits.max_prompt_tokens
+  if (!maxPromptTokens) return MAX_PAYLOAD_BYTES
+  const tokenDerivedBytes = Math.floor(
+    (maxPromptTokens - TOKEN_RESERVE) * CHARS_PER_TOKEN_ESTIMATE,
+  )
+  return Math.min(MAX_PAYLOAD_BYTES, tokenDerivedBytes)
+}
+
+/**
+ * Fit a payload within the model's effective byte ceiling. Returns the input
  * payload unmodified in the common case (cheap byte size check).
  */
 export function fitContext(
   payload: ChatCompletionsPayload,
-  _model: Model,
+  model: Model,
 ): ChatCompletionsPayload {
   const initialBytes = estimatePayloadBytes(payload)
+  const ceiling = computeEffectiveCeiling(model)
 
-  // Fast path: well under the gateway ceiling — just send.
-  if (initialBytes <= MAX_PAYLOAD_BYTES) {
+  // Fast path: well under the effective ceiling — just send.
+  if (initialBytes <= ceiling) {
     return payload
   }
 
   consola.info(
-    `Context fit: payload ${formatBytes(initialBytes)} exceeds ${formatBytes(MAX_PAYLOAD_BYTES)} ceiling — reducing`,
+    `Context fit: payload ${formatBytes(initialBytes)} exceeds ${formatBytes(ceiling)} ceiling — reducing`,
   )
 
   // Slow path: progressive byte-based reduction.
   let current = pruneToolOutputs(payload)
   let bytes = estimatePayloadBytes(current)
-  if (bytes <= MAX_PAYLOAD_BYTES) {
+  if (bytes <= ceiling) {
     consola.info(
       `Context fit: ${formatBytes(initialBytes)} → ${formatBytes(bytes)} after tool pruning`,
     )
@@ -95,7 +145,7 @@ export function fitContext(
 
   current = stripOldImages(current)
   bytes = estimatePayloadBytes(current)
-  if (bytes <= MAX_PAYLOAD_BYTES) {
+  if (bytes <= ceiling) {
     consola.info(
       `Context fit: ${formatBytes(initialBytes)} → ${formatBytes(bytes)} after stripping old images`,
     )
@@ -105,7 +155,7 @@ export function fitContext(
   // Aggressive: strip ALL images regardless of age.
   current = stripAllImages(current)
   bytes = estimatePayloadBytes(current)
-  if (bytes <= MAX_PAYLOAD_BYTES) {
+  if (bytes <= ceiling) {
     consola.warn(
       `Context fit: ${formatBytes(initialBytes)} → ${formatBytes(bytes)} after stripping ALL images`,
     )
@@ -115,14 +165,14 @@ export function fitContext(
   // Truncate any oversized tool outputs that survived pruning (e.g. recent ones).
   current = truncateOversizedToolOutputs(current)
   bytes = estimatePayloadBytes(current)
-  if (bytes <= MAX_PAYLOAD_BYTES) {
+  if (bytes <= ceiling) {
     consola.warn(
       `Context fit: ${formatBytes(initialBytes)} → ${formatBytes(bytes)} after truncating oversized tool outputs`,
     )
     return current
   }
 
-  current = dropOldMessages(current)
+  current = dropOldMessages(current, ceiling)
   bytes = estimatePayloadBytes(current)
   consola.warn(
     `Context fit: ${formatBytes(initialBytes)} → ${formatBytes(bytes)} after dropping old messages`,
@@ -318,6 +368,7 @@ function truncateOversizedToolOutputs(
 
 function dropOldMessages(
   payload: ChatCompletionsPayload,
+  ceiling: number,
 ): ChatCompletionsPayload {
   const systemMessages = payload.messages.filter(
     (m) => m.role === "system" || m.role === "developer",
@@ -340,7 +391,7 @@ function dropOldMessages(
   let totalBytes = baseBytes + convBytes.reduce((a, b) => a + b, 0)
 
   let dropped = 0
-  while (conversationMessages.length > 2 && totalBytes > MAX_PAYLOAD_BYTES) {
+  while (conversationMessages.length > 2 && totalBytes > ceiling) {
     const removedBytes = convBytes.shift() ?? 0
     conversationMessages.shift()
     totalBytes -= removedBytes
@@ -349,13 +400,13 @@ function dropOldMessages(
 
   if (dropped > 0) {
     consola.warn(
-      `Dropped ${dropped} oldest conversation messages (~${totalBytes} bytes remaining, limit ${MAX_PAYLOAD_BYTES})`,
+      `Dropped ${dropped} oldest conversation messages (~${totalBytes} bytes remaining, limit ${ceiling})`,
     )
   }
 
-  if (totalBytes > MAX_PAYLOAD_BYTES) {
+  if (totalBytes > ceiling) {
     consola.error(
-      `Payload still over ${MAX_PAYLOAD_BYTES}B after all reductions (${totalBytes}B). Forwarding anyway — Copilot will likely return 413 → 400 prompt-too-long for reactive compaction.`,
+      `Payload still over ${ceiling}B after all reductions (${totalBytes}B). Forwarding anyway — Copilot will likely return 413 → 400 prompt-too-long for reactive compaction.`,
     )
   }
 
