@@ -398,9 +398,27 @@ function dropOldMessages(
     dropped++
   }
 
-  if (dropped > 0) {
+  // Avoid stranding a tool_result whose corresponding tool_use was just
+  // dropped. Copilot/Vertex rejects with "unexpected tool_use_id ... Each
+  // tool_result block must have a corresponding tool_use block in the
+  // previous message." Keep dropping from the front while the new head is
+  // either a `tool` role message OR a user/assistant message whose content
+  // begins with a tool_result/tool_use_id reference. Cheapest heuristic:
+  // drop while head.role === "tool".
+  let orphansDropped = 0
+  while (
+    conversationMessages.length > 2
+    && conversationMessages[0].role === "tool"
+  ) {
+    const removedBytes = convBytes.shift() ?? 0
+    conversationMessages.shift()
+    totalBytes -= removedBytes
+    orphansDropped++
+  }
+
+  if (dropped > 0 || orphansDropped > 0) {
     consola.warn(
-      `Dropped ${dropped} oldest conversation messages (~${totalBytes} bytes remaining, limit ${ceiling})`,
+      `Dropped ${dropped} oldest conversation messages + ${orphansDropped} orphaned tool results (~${totalBytes} bytes remaining, limit ${ceiling})`,
     )
   }
 
