@@ -228,6 +228,7 @@ export interface ChatCompletionsPayload {
   logprobs?: boolean | null
   response_format?: { type: "json_object" } | null
   seed?: number | null
+  thinking?: { type: "enabled" | "disabled" } | null
   tools?: Array<Tool> | null
   tool_choice?:
     | "none"

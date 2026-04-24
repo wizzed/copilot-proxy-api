@@ -44,6 +44,7 @@ export function translateToOpenAI(
     user: payload.metadata?.user_id,
     tools: translateAnthropicToolsToOpenAI(payload.tools),
     tool_choice: translateAnthropicToolChoiceToOpenAI(payload.tool_choice),
+    thinking: translateAnthropicThinkingToOpenAI(payload.thinking),
   }
 }
 
@@ -407,6 +408,20 @@ function translateAnthropicToolsToOpenAI(
       parameters: tool.input_schema,
     },
   }))
+}
+
+/**
+ * Map Anthropic `thinking` to the Copilot-compatible format.
+ * Anthropic uses `'enabled'` and `'adaptive'`; Copilot only accepts
+ * `'enabled'` or `'disabled'`. Both `'enabled'` and `'adaptive'` map to
+ * `'enabled'` since they both request extended thinking.
+ */
+function translateAnthropicThinkingToOpenAI(
+  thinking: AnthropicMessagesPayload["thinking"],
+): ChatCompletionsPayload["thinking"] {
+  if (!thinking) return undefined
+  // Copilot only supports 'enabled' | 'disabled' — map 'adaptive' to 'enabled'
+  return { type: "enabled" }
 }
 
 function translateAnthropicToolChoiceToOpenAI(
