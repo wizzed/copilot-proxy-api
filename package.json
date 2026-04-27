@@ -1,6 +1,6 @@
 {
   "name": "copilot-proxy-api",
-  "version": "0.10.6",
+  "version": "0.10.7",
   "description": "Turn GitHub Copilot into OpenAI/Anthropic API compatible server. Usable with Claude Code and Codex CLI!",
   "keywords": [
     "proxy",
