@@ -43,7 +43,7 @@ export interface ResponsesContentPart {
 }
 
 export interface ResponsesTool {
-  type: "function" | "web_search_preview" | "file_search"
+  type: "function" | "web_search_preview" | "file_search" | "image_generation"
   function?: {
     name: string
     description?: string

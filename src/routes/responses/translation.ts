@@ -64,6 +64,11 @@ export function translateResponsesToChat(
     }
   }
 
+  // Map Responses API reasoning to Copilot thinking.
+  // Any non-disabled effort level enables extended thinking.
+  const thinking: ChatCompletionsPayload["thinking"] =
+    request.reasoning ? { type: "enabled" } : undefined
+
   return {
     model: request.model,
     messages,
@@ -73,6 +78,7 @@ export function translateResponsesToChat(
     stream: request.stream,
     tools,
     tool_choice: toolChoice,
+    thinking,
   }
 }
 

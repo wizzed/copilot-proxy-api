@@ -360,42 +360,60 @@ You can also read more about IDE integration here: [Add Claude Code to your IDE]
 
 ## Using with Codex CLI
 
-This proxy supports the [OpenAI Codex CLI](https://github.com/openai/codex) through the Responses API endpoint (`/v1/responses`).
+This proxy supports the [OpenAI Codex CLI](https://github.com/openai/codex) through the Responses API endpoint (`/v1/responses`). Latest Codex versions use provider configuration from `~/.codex/config.toml`; setting `OPENAI_BASE_URL` alone is not enough.
 
 ### Configuration
 
 Add the following to your `~/.codex/config.toml`:
 
 ```toml
-model = "gpt-5.2"
-model_provider = "copilot-proxy"
+model = "gpt-5.5"
+model_provider = "copilot_proxy"
+model_reasoning_effort = "high"
 
-[model_providers.copilot-proxy]
-name = "GitHub Copilot (via copilot-proxy-api)"
+[model_providers.copilot_proxy]
+name = "GitHub Copilot via copilot-proxy-api"
 base_url = "http://localhost:4141/v1"
 wire_api = "responses"
-env_key = "OPENAI_API_KEY"
-```
-
-Then set the environment variable (the value doesn't matter, it just needs to be set):
-
-```sh
-# Windows (permanent)
-setx OPENAI_API_KEY "dummy"
-
-# Linux/macOS
-export OPENAI_API_KEY="dummy"
 ```
 
 Start the proxy server and run Codex:
 
 ```sh
-# Start the proxy
+# Terminal 1: start the proxy
 npx copilot-proxy-api@latest start
 
-# In another terminal, run Codex
+# Terminal 2: run Codex
 codex
 ```
+
+To test the setup non-interactively:
+
+```sh
+codex exec "Say exactly: proxy ok"
+```
+
+Expected output includes `proxy ok` and Codex should show `provider: copilot_proxy`.
+
+### Switching Back to Official Codex/OpenAI
+
+To use Codex's default backend again, remove or comment this line in `~/.codex/config.toml`:
+
+```toml
+model_provider = "copilot_proxy"
+```
+
+Or override it for one run:
+
+```sh
+codex -c model_provider='"openai"'
+```
+
+### Notes
+
+- `service_tier = "fast"` is ChatGPT-plan-specific. Codex may send it, but Copilot's Responses API rejects it, so the proxy strips it before forwarding.
+- `model_reasoning_effort = "high"` is supported and is forwarded through the Responses API request.
+- Codex may log a warning while refreshing model metadata because its model catalog format differs from OpenAI's `/v1/models` list format. This does not block normal model calls.
 
 ## Running from Source
 
